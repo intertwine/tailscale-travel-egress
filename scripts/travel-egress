@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# A small macOS helper for using a Tailscale exit node on restricted networks.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: travel-egress <on|off|status|route-add|route-del> [options]
+  -n, --exit-node NAME    Exit node hostname or Tailscale IP (required for on)
+  -c, --bypass-cidr CIDR   Narrow IPv4 prefix to route outside the exit node
+  -i, --interface NAME    Physical network interface (default: en0)
+  -h, --help              Show help
+
+Environment defaults: TRAVEL_EXIT_NODE, TRAVEL_BYPASS_CIDR, TRAVEL_INTERFACE.
+route-add/route-del need sudo. They change only the requested CIDR, not DNS or
+Tailscale itself. A route exception exposes that destination to the local ISP.
+EOF
+}
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+command_name=${1:-}
+if [[ $command_name == -h || $command_name == --help ]]; then usage; exit 0; fi
+[[ -n $command_name ]] || { usage >&2; exit 2; }
+shift
+exit_node=${TRAVEL_EXIT_NODE:-}
+bypass_cidr=${TRAVEL_BYPASS_CIDR:-}
+interface=${TRAVEL_INTERFACE:-en0}
+while (($#)); do
+  case $1 in
+    -n|--exit-node) (($# >= 2)) || fail "missing value for $1"; exit_node=$2; shift 2 ;;
+    -c|--bypass-cidr) (($# >= 2)) || fail "missing value for $1"; bypass_cidr=$2; shift 2 ;;
+    -i|--interface) (($# >= 2)) || fail "missing value for $1"; interface=$2; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+done
+
+require_cidr() {
+  [[ -n $bypass_cidr ]] || fail 'supply --bypass-cidr (choose the narrowest needed IPv4 prefix)'
+  [[ $bypass_cidr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || fail 'expected an IPv4 CIDR'
+  [[ $bypass_cidr != 0.0.0.0/0 ]] || fail 'refusing a direct default route; choose a narrow service prefix'
+}
+
+tailscale_bin() {
+  if command -v tailscale >/dev/null 2>&1; then command -v tailscale
+  elif [[ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]]; then
+    printf '%s\n' /Applications/Tailscale.app/Contents/MacOS/Tailscale
+  else fail 'Tailscale CLI not found; install and sign in to the app first'
+  fi
+}
+
+case $command_name in
+  on)
+    [[ -n $exit_node ]] || fail 'supply --exit-node (or TRAVEL_EXIT_NODE)'
+    "$(tailscale_bin)" set --exit-node="$exit_node" --exit-node-allow-lan-access=true
+    ;;
+  off)
+    "$(tailscale_bin)" set --exit-node=
+    ;;
+  status)
+    "$(tailscale_bin)" status
+    printf '\nExit nodes:\n'
+    "$(tailscale_bin)" exit-node list
+    if [[ -n $bypass_cidr ]]; then
+      require_cidr
+      printf '\nRoute lookup for %s (may be the default; not proof of an exception):\n' "$bypass_cidr"
+      route -n get "${bypass_cidr%/*}"
+    fi
+    ;;
+  route-add)
+    require_cidr
+    # The plain default route may point into the VPN. Scope lookup to the
+    # physical interface so a route can be repaired while the tunnel is on.
+    gateway=$(route -n get -ifscope "$interface" default | awk '$1 == "gateway:" {print $2; exit}')
+    [[ -n $gateway ]] || fail "no gateway for $interface; join/authenticate to Wi-Fi first"
+    sudo -v
+    # Replacing the same prefix supports changes of Wi-Fi gateway. We do not
+    # delete other prefixes, since their ownership is unknown.
+    sudo route -n delete -net "$bypass_cidr" >/dev/null 2>&1 || true
+    sudo route -n add -net "$bypass_cidr" "$gateway"
+    ;;
+  route-del)
+    require_cidr
+    sudo route -n delete -net "$bypass_cidr"
+    ;;
+  *) fail "unknown command: $command_name" ;;
+esac
